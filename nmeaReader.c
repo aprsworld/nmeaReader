@@ -1,0 +1,470 @@
+#define _GNU_SOURCE
+#include <stdio.h>
+#include <errno.h>
+#include <fcntl.h> 
+#include <string.h>
+#include <termios.h>
+#include <unistd.h>
+#include <sys/time.h>
+#include <stdlib.h>
+#include <limits.h>
+#include <stdint.h>
+#include <signal.h>
+#include <sys/types.h>
+#include <sys/socket.h>
+#include <sys/ioctl.h>
+#include <net/if.h>
+#include <string.h>
+#include <getopt.h>
+#include <netinet/in.h>
+#include <netdb.h> 
+
+extern char *optarg;
+extern int optind, opterr, optopt;
+
+int outputDebug=0;
+
+#define DATA_BLOCK_N 32 /* maximum number of NMEA sentences */
+
+typedef struct {
+	uint64_t microtime_start;	/* time when STX was received*/
+	uint8_t sentence[128];		/* full sentence ('$' to second character of checksum), null terminated */
+} struct_data_block;
+
+/* array of data_blocks to put Magnum network data into */
+struct_data_block data_block[DATA_BLOCK_N];
+
+uint64_t microtime() {
+	struct timeval time;
+	gettimeofday(&time, NULL); 
+	return ((uint64_t)time.tv_sec * 1000000) + time.tv_usec;
+}
+
+void dump_current_json() {
+	int i;
+	int printed;
+
+/*
+{
+	"GPGGA": {
+		"age": 1234,
+		"sentence": "$GPGGA,121,0943,z,*45"
+	},
+	"GPRMC": {
+		"age": 97834,
+		"sentence": "$GPRMC,some sentence,,121,0943,z,*DA"
+	}
+}
+*/
+
+	printf("{\n");
+
+	printed=0;
+
+	for ( i=0 ; i < DATA_BLOCK_N ; i++ ) {
+		if ( 0 == data_block[i].microtime_start ) {
+			continue;
+		}
+
+		if ( 0 != printed ) {
+			printf(",\n");
+		}
+
+		printed++;
+
+		printf("\t\"%.*s\": {\n",5,data_block[i].sentence+1);
+
+		printf("\t\t\"age\": %d,\n",(int) (microtime() - data_block[i].microtime_start) );
+		printf("\t\t\"sentence\": \"%s\"\n",data_block[i].sentence);
+		printf("\t}");
+	}
+
+	printf("\n}\n");
+}
+
+void signal_handler(int signum) {
+	int i, j;
+
+
+	if ( SIGALRM == signum ) {
+		fprintf(stderr,"\n# Timeout while waiting for Magnum network data.\n");
+		fprintf(stderr,"# Terminating.\n");
+		exit(100);
+	} else if ( SIGPIPE == signum ) {
+		fprintf(stderr,"\n# Broken pipe to TCP server.\n");
+		fprintf(stderr,"# Terminating.\n");
+		exit(101);
+	} else if ( SIGUSR1 == signum ) {
+		/* clear signal */
+		signal(SIGUSR1, SIG_IGN);
+
+		fprintf(stderr,"# SIGUSR1 triggered data_block dump:\n");
+#if 0
+		for ( i=0 ; i < DATA_BLOCK_N ; i++ ) {
+			if ( 0 == data_block[i].microtime_start ) {
+				continue;
+			}
+
+			fprintf(stderr,"# data_block[%d].age=%d\n",i,(int) (microtime() - data_block[i].microtime_start) );
+			fprintf(stderr,"# data_block[%d].microtime_start=%llu\n",i,data_block[i].microtime_start);
+			fprintf(stderr,"# data_block[%d].sentence       ='%s'\n",i,data_block[i].sentence);
+		}
+#endif
+		
+		dump_current_json();
+
+		/* re-install alarm handler */
+		signal(SIGUSR1, signal_handler);
+	} else {
+		fprintf(stderr,"\n# Caught unexpected signal %d.\n",signum);
+		fprintf(stderr,"# Terminating.\n");
+		exit(102);
+	}
+
+}
+
+int set_interface_attribs (int fd, int speed, int parity) {
+	struct termios tty;
+
+	memset (&tty, 0, sizeof tty);
+	if (tcgetattr (fd, &tty) != 0) {
+//		error_message ("error %d from tcgetattr", errno);
+		return -1;
+	}
+
+	cfsetospeed (&tty, speed);
+	cfsetispeed (&tty, speed);
+
+	tty.c_cflag = (tty.c_cflag & ~CSIZE) | CS8;     // 8-bit chars
+	// disable IGNBRK for mismatched speed tests; otherwise receive break
+	// as \000 chars
+	tty.c_iflag &= ~IGNBRK;	// disable break processing
+	tty.c_lflag = 0;	// no signaling chars, no echo,
+				// no canonical processing
+	tty.c_oflag = 0;	// no remapping, no delays
+	tty.c_cc[VMIN]  = 0;	// read doesn't block
+	tty.c_cc[VTIME] = 5;	// 0.5 seconds read timeout
+
+	tty.c_iflag &= ~(IXON | IXOFF | IXANY); // shut off xon/xoff ctrl
+
+	tty.c_cflag |= (CLOCAL | CREAD);// ignore modem controls,
+					// enable reading
+	tty.c_cflag &= ~(PARENB | PARODD);      // shut off parity
+	tty.c_cflag |= parity;
+	tty.c_cflag &= ~CSTOPB;
+	tty.c_cflag &= ~CRTSCTS;
+
+	if (tcsetattr (fd, TCSANOW, &tty) != 0) {
+//		error_message ("error %d from tcsetattr", errno);
+		return -1;
+	}
+	return 0;
+}
+
+void set_blocking (int fd, int vmin, int vtime) {
+	struct termios tty;
+	memset (&tty, 0, sizeof tty);
+	if (tcgetattr (fd, &tty) != 0) {
+		fprintf(stderr,"# set_blocking unable to load tty attributes\n");
+		return;
+	}
+
+	tty.c_cc[VMIN]  = vmin;	// minimum  number of characters for noncanonical read
+	tty.c_cc[VTIME] = vtime; // timeout in deciseconds for noncanonical read
+
+	if ( outputDebug ) {
+		fprintf(stderr,"# set_blocking tty.c_cc[VMIN]=%d\n",tty.c_cc[VMIN]);
+		fprintf(stderr,"# set_blocking tty.c_cc[VTIME]=%d\n",tty.c_cc[VTIME]);
+	}
+
+	if (tcsetattr (fd, TCSANOW, &tty) != 0) {
+		printf("error %d setting term attributes", errno);
+	}
+
+}
+
+
+void packet_processor(char *packet, int length, uint64_t microtime_start) {
+	int i,data_pos;
+	int lChecksum,rChecksum;
+	int oldest_pos;
+
+#if 0
+	if ( length > sizeof(data_block[0].data) ) {
+		fprintf(stderr,"# ERROR! packet length=%d > sizeof(data_block.data)=%d. This should not happen. Truncating!\n",length,sizeof(data_block[0].data));
+		length=sizeof(data_block[0].length);
+	}
+#endif
+
+	/* quick sanity check */
+	if ( length < 9 )
+		return;
+
+	/* null terminate so we can use string functions going forwards */
+	packet[length]='\0';
+
+	
+#if 0
+	if ( outputDebug ) {
+		printf("#  packet_processor()  length=%d\n",length);
+
+		for( i=0 ; i<length ; i++ ) {
+			printf("\tpacket[%d]=0x%02x (%c)\n",i,packet[i],packet[i]);
+		}
+
+		printf("\n");
+	}
+#endif
+
+	/* calculate local checksum */
+	lChecksum=0;
+	for ( i=1 ; i<length-3 ; i++ ) {
+		lChecksum = lChecksum ^ packet[i];
+	}
+
+	/* read remote checksum */
+	if ( 1 != sscanf(packet+length-2,"%x",&rChecksum) ) {
+		if ( outputDebug ) {
+			printf("(error scanning remote checksum hex)\n");
+		}
+		return;
+	}
+
+	/* compare local and remote checksums */
+	if ( lChecksum != rChecksum ) {
+		if ( outputDebug ) {
+			printf("(remote and local checksum do not match!)\n");
+		}
+		return;
+	}
+
+	/* at this point we have a valid NMEA sentence */
+
+	/* scan through data blocks and replace existing sentence with same talker
+	or put in first available empty or put in place of oldest */
+	for ( i=0, data_pos=-1,oldest_pos=0 ; i<DATA_BLOCK_N ; i++ ) {
+		/* empty position */
+		if ( -1 ==data_pos && '\0' == data_block[i].sentence[0] ) {
+			data_pos=i;
+		}
+
+		/* match on first 6 characters */
+		if ( 0 ==strncmp(data_block[i].sentence,packet,6) ) {
+			data_pos=i;
+			break;
+		}
+
+		/* update oldest_pos if we are older */
+		if ( data_block[i].microtime_start < data_block[oldest_pos].microtime_start ) {
+			oldest_pos=i;
+		}
+	}
+
+	/* copy data to appropriate position */
+	if ( -1 != data_pos ) {
+		data_block[data_pos].microtime_start=microtime_start;
+		strcpy(data_block[data_pos].sentence,packet);
+	} else { 
+		if ( outputDebug ) {
+			printf("(replacing data block %d (oldest) with new data since all blocks are full)\n",oldest_pos);
+		}
+
+		data_block[oldest_pos].microtime_start=microtime_start;
+		strcpy(data_block[oldest_pos].sentence,packet);
+	}
+
+
+}
+
+
+void init() {
+	int i;
+
+	/* initialize the data strutures */
+	for ( i=0 ; i < DATA_BLOCK_N ; i++ ) {
+//		fprintf(stderr,"# initializing data_block[%d]\n",i);
+		data_block[i].sentence[0]='\0';
+		data_block[i].microtime_start=0;
+	}
+
+}
+
+
+#define STATE_LOOKING_FOR_STX 0
+#define STATE_IN_PACKET       1
+
+
+int main(int argc, char **argv) {
+	char *portname = "/dev/ttyAMA0";
+	int fd;
+	char packet[128];
+	int packet_pos=0;
+
+	int alarmSeconds=5;
+	int i,n;
+	int sockfd;
+	int tcpPort;
+	struct sockaddr_in serveraddr;
+	struct hostent *server;
+
+	uint64_t microtime_now, microtime_start;
+	int milliseconds_since_stx;
+	char buff[1];
+
+	int state;
+
+	int milliseconds_timeout=500;
+
+
+	/* command line arguments */
+	while ((n = getopt (argc, argv, "a:hi:p:s:vt:")) != -1) {
+		switch (n) {
+			case 't':
+				milliseconds_timeout=atoi(optarg);
+				fprintf(stdout,"# timeout packet after %d milliseconds since start\n",milliseconds_timeout);
+				break;
+			case 'a':
+				alarmSeconds=atoi(optarg);
+				fprintf(stdout,"# terminate program after %d seconds without receiving data\n",alarmSeconds);
+				break;
+			case 'p':
+				tcpPort=atoi(optarg);
+				fprintf(stdout,"# TCP server port = %d\n",tcpPort);
+				break;
+			case 's':
+				n=atoi(optarg);
+				fprintf(stdout,"# Delaying startup for %d seconds ",n);
+				fflush(stdout);
+				for ( i=0 ; i<n ; i++ ) {
+					sleep(1);
+					fputc('.',stdout);
+					fflush(stdout);
+				}
+				fprintf(stdout," done\n");
+				fflush(stdout);
+				break;
+			case 'i':
+				strncpy(portname,optarg,sizeof(portname));
+				portname[sizeof(portname)-1]='\0';
+				fprintf(stderr,"# serial port = %s\n",portname);
+				break;
+			case 'v':
+				outputDebug=1;
+				fprintf(stderr,"# verbose (debugging) output to stderr enabled\n");
+				break;
+			case 'h':
+				fprintf(stdout,"# -a seconds\tTerminate after seconds without data\n");
+				fprintf(stdout,"# -t milliseconds\tTimeout packet after milliseconds since start\n");
+				fprintf(stdout,"# -s seconds\tstartup delay\n");
+				fprintf(stdout,"# -p tcpPort\tTCP server port number\n");
+				fprintf(stdout,"# -v\t\tOutput verbose / debugging to stderr\n");
+				fprintf(stdout,"# -i\t\tserial device to use (default: /dev/ttyAMA0)\n");
+				fprintf(stdout,"#\n");
+				fprintf(stdout,"# -h\t\tThis help message then exit\n");
+				fprintf(stdout,"#\n");
+				exit(0);
+		}
+	}
+
+	/* initialize data structures */
+	init();
+
+
+	/* install signal handler */
+	signal(SIGALRM, signal_handler); /* timeout */
+	signal(SIGUSR1, signal_handler); /* user signal to do data block debug dump */
+	signal(SIGPIPE, signal_handler); /* broken TCP connection */
+
+	/* setup serial port for Magnum network */
+	fd = open (portname, O_RDWR | O_NOCTTY | O_SYNC);
+	
+	if (fd < 0) {
+		fprintf(stderr,"# error opening serial port. Aborting.\n");
+		exit(1);
+	}	
+
+	/* NMEA runs at 4800 baud */
+	set_interface_attribs (fd, B4800, 0);  // set speed to 4800 bps, 8n1 (no parity)
+	set_blocking (fd, 0, 100);		// blocking with 10 second timeout
+
+	/* set an alarm to send a SIGALARM if data not received within alarmSeconds */
+	alarm(alarmSeconds);
+
+	state=STATE_LOOKING_FOR_STX;
+	microtime_start=0;
+
+	/* read data from serial port */
+	for ( ; ; ) {
+		n = read (fd, buff, sizeof(buff));  // read next character if ready
+		microtime_now=microtime();
+
+		/* non-blocking, so we will get here if there was no data available */
+		/* read timeout */
+		if ( 0 == n ) {
+			if ( outputDebug ) {
+				printf("(read returned 0 bytes)\n",n);
+			}
+			continue;
+		}
+
+		/* cancel pending alarm */
+		alarm(0);
+		/* set an alarm to send a SIGALARM if data not received within alarmSeconds */
+		alarm(alarmSeconds);
+
+		milliseconds_since_stx=(int) ((microtime_now-microtime_start)/1000.0);
+
+
+
+
+		/* NMEA packets:
+			start with '$'
+			end with '\r' or '\n'
+			get aborted on timeout
+		*/
+
+		/* copy byte to packet */
+		for ( i=0 ; i<n ; i++ ) {
+			/* look for start character */
+			if ( STATE_LOOKING_FOR_STX == state && '$' ==  buff[i] ) {
+				packet_pos=0;
+				microtime_start=microtime_now;
+				state=STATE_IN_PACKET;
+				packet[0]='$';
+			}
+
+			if ( STATE_IN_PACKET == state ) {
+//				printf("---> milliseconds_since_stx = %d\n",milliseconds_since_stx);
+				if ( milliseconds_since_stx > milliseconds_timeout ) {
+					packet_pos=0;
+					state=STATE_LOOKING_FOR_STX;
+
+					if ( outputDebug ) {
+						printf("(timeout while reading NMEA sentence)\n");
+					}
+					continue;
+				}
+		
+				if ( '\r' == buff[i] || '\n' == buff[i] ) {
+					state=STATE_LOOKING_FOR_STX;
+
+					/* process packet */
+					packet_processor(packet,packet_pos,microtime_start);
+				}
+
+				if ( packet_pos < sizeof(packet)-1 ) {
+					packet[packet_pos]=buff[i];
+					packet_pos++;
+				} else {
+					if ( outputDebug ) {
+						printf("(packet length exceeded length of buffer!)\n");
+					}
+				}
+
+			}
+
+		}
+	}
+
+	exit(0);
+}
