@@ -23,6 +23,8 @@ extern char *optarg;
 extern int optind, opterr, optopt;
 
 int outputDebug=0;
+int milliseconds_timeout=500;
+int alarmSeconds=5;
 
 #define DATA_BLOCK_N 32 /* maximum number of NMEA sentences */
 
@@ -30,9 +32,11 @@ typedef struct {
 	uint64_t microtime_start;	/* time when STX was received*/
 	uint8_t sentence[128];		/* full sentence ('$' to second character of checksum), null terminated */
 } struct_data_block;
+#define DUMP_CURRENT_JSON_SUGGESTED_SIZE (DATA_BLOCK_N * 2 * sizeof(data_block[0].sentence))
 
 /* array of data_blocks to put Magnum network data into */
 struct_data_block data_block[DATA_BLOCK_N];
+
 
 uint64_t microtime() {
 	struct timeval time;
@@ -40,9 +44,11 @@ uint64_t microtime() {
 	return ((uint64_t)time.tv_sec * 1000000) + time.tv_usec;
 }
 
-void dump_current_json() {
+
+void dump_current_json(char *buff) {
 	int i;
 	int printed;
+	char buff2[256];
 
 /*
 {
@@ -57,7 +63,7 @@ void dump_current_json() {
 }
 */
 
-	printf("{\n");
+	sprintf(buff,"{\n");
 
 	printed=0;
 
@@ -67,31 +73,40 @@ void dump_current_json() {
 		}
 
 		if ( 0 != printed ) {
-			printf(",\n");
+			sprintf(buff2,",\n");
+			strcat(buff,buff2);
 		}
 
 		printed++;
 
-		printf("\t\"%.*s\": {\n",5,data_block[i].sentence+1);
+		sprintf(buff2,"\t\"%.*s\": {\n",5,data_block[i].sentence+1);
+		strcat(buff,buff2);
 
-		printf("\t\t\"age\": %d,\n",(int) (microtime() - data_block[i].microtime_start) );
-		printf("\t\t\"sentence\": \"%s\"\n",data_block[i].sentence);
-		printf("\t}");
+		sprintf(buff2,"\t\t\"age\": %d,\n",(int) (microtime() - data_block[i].microtime_start) );
+		strcat(buff,buff2);
+
+		sprintf(buff2,"\t\t\"sentence\": \"%s\"\n",data_block[i].sentence);
+		strcat(buff,buff2);
+
+		sprintf(buff2,"\t}");
+		strcat(buff,buff2);
 	}
 
-	printf("\n}\n");
+	sprintf(buff2,"\n}\n");
+	strcat(buff,buff2);
 }
 
 void signal_handler(int signum) {
 	int i, j;
+	char buff[DUMP_CURRENT_JSON_SUGGESTED_SIZE];
 
 
 	if ( SIGALRM == signum ) {
-		fprintf(stderr,"\n# Timeout while waiting for Magnum network data.\n");
+		fprintf(stderr,"\n# Timeout while waiting for NMEA data.\n");
 		fprintf(stderr,"# Terminating.\n");
 		exit(100);
 	} else if ( SIGPIPE == signum ) {
-		fprintf(stderr,"\n# Broken pipe to TCP server.\n");
+		fprintf(stderr,"\n# Broken pipe.\n");
 		fprintf(stderr,"# Terminating.\n");
 		exit(101);
 	} else if ( SIGUSR1 == signum ) {
@@ -99,19 +114,9 @@ void signal_handler(int signum) {
 		signal(SIGUSR1, SIG_IGN);
 
 		fprintf(stderr,"# SIGUSR1 triggered data_block dump:\n");
-#if 0
-		for ( i=0 ; i < DATA_BLOCK_N ; i++ ) {
-			if ( 0 == data_block[i].microtime_start ) {
-				continue;
-			}
-
-			fprintf(stderr,"# data_block[%d].age=%d\n",i,(int) (microtime() - data_block[i].microtime_start) );
-			fprintf(stderr,"# data_block[%d].microtime_start=%llu\n",i,data_block[i].microtime_start);
-			fprintf(stderr,"# data_block[%d].sentence       ='%s'\n",i,data_block[i].sentence);
-		}
-#endif
 		
-		dump_current_json();
+		dump_current_json(buff);
+		printf("%s\n",buff);
 
 		/* re-install alarm handler */
 		signal(SIGUSR1, signal_handler);
@@ -189,13 +194,6 @@ void packet_processor(char *packet, int length, uint64_t microtime_start) {
 	int lChecksum,rChecksum;
 	int oldest_pos;
 
-#if 0
-	if ( length > sizeof(data_block[0].data) ) {
-		fprintf(stderr,"# ERROR! packet length=%d > sizeof(data_block.data)=%d. This should not happen. Truncating!\n",length,sizeof(data_block[0].data));
-		length=sizeof(data_block[0].length);
-	}
-#endif
-
 	/* quick sanity check */
 	if ( length < 9 )
 		return;
@@ -204,17 +202,6 @@ void packet_processor(char *packet, int length, uint64_t microtime_start) {
 	packet[length]='\0';
 
 	
-#if 0
-	if ( outputDebug ) {
-		printf("#  packet_processor()  length=%d\n",length);
-
-		for( i=0 ; i<length ; i++ ) {
-			printf("\tpacket[%d]=0x%02x (%c)\n",i,packet[i],packet[i]);
-		}
-
-		printf("\n");
-	}
-#endif
 
 	/* calculate local checksum */
 	lChecksum=0;
@@ -289,31 +276,116 @@ void init() {
 
 }
 
+int json_to_client(int filedes) {
+	char buff[DUMP_CURRENT_JSON_SUGGESTED_SIZE];
+
+	dump_current_json(buff);
+	write(filedes,buff,strlen(buff));
+	return -1;
+}
+
 
 #define STATE_LOOKING_FOR_STX 0
 #define STATE_IN_PACKET       1
 
-
-int main(int argc, char **argv) {
-	char *portname = "/dev/ttyAMA0";
-	int fd;
-	char packet[128];
-	int packet_pos=0;
-
-	int alarmSeconds=5;
+void serial_process(int serialfd) {
 	int i,n;
-	int sockfd;
-	int tcpPort;
-	struct sockaddr_in serveraddr;
-	struct hostent *server;
-
-	uint64_t microtime_now, microtime_start;
+	uint64_t microtime_now;
 	int milliseconds_since_stx;
 	char buff[1];
 
-	int state;
 
-	int milliseconds_timeout=500;
+	static char packet[128];
+	static int packet_pos=0;
+	static uint64_t microtime_start=0;
+	static int state=STATE_LOOKING_FOR_STX;
+
+	n = read (serialfd, buff, sizeof(buff));  // read next character if ready
+	microtime_now=microtime();
+
+//`	printf("# read buff[0]=%c\n",buff[0]);
+
+	/* non-blocking, so we will get here if there was no data available */
+	/* read timeout */
+	if ( 0 == n ) {
+		if ( outputDebug ) {
+			printf("(read returned 0 bytes)\n",n);
+		}
+		return;
+	}
+
+	/* cancel pending alarm */
+	alarm(0);
+	/* set an alarm to send a SIGALARM if data not received within alarmSeconds */
+	alarm(alarmSeconds);
+
+	milliseconds_since_stx=(int) ((microtime_now-microtime_start)/1000.0);
+
+
+	/* NMEA packets:
+		start with '$'
+		end with '\r' or '\n'
+		get aborted on timeout
+	*/
+
+	/* copy byte to packet */
+	for ( i=0 ; i<n ; i++ ) {
+		/* look for start character */
+		if ( STATE_LOOKING_FOR_STX == state && '$' ==  buff[i] ) {
+			packet_pos=0;
+			microtime_start=microtime_now;
+			state=STATE_IN_PACKET;
+			packet[0]='$';
+		}
+
+		if ( STATE_IN_PACKET == state ) {
+//			printf("---> milliseconds_since_stx = %d\n",milliseconds_since_stx);
+			if ( milliseconds_since_stx > milliseconds_timeout ) {
+				packet_pos=0;
+				state=STATE_LOOKING_FOR_STX;
+
+				if ( outputDebug ) {
+					printf("(timeout while reading NMEA sentence)\n");
+				}
+				continue;
+			}
+	
+			if ( '\r' == buff[i] || '\n' == buff[i] ) {
+				state=STATE_LOOKING_FOR_STX;
+
+				/* process packet */
+				packet_processor(packet,packet_pos,microtime_start);
+			}
+
+			if ( packet_pos < sizeof(packet)-1 ) {
+				packet[packet_pos]=buff[i];
+				packet_pos++;
+			} else {
+				if ( outputDebug ) {
+					printf("(packet length exceeded length of buffer!)\n");
+				}
+			}
+
+		}
+
+	}
+
+}
+
+int main(int argc, char **argv) {
+	char *portname = "/dev/ttyAMA0";
+	int serialfd;
+
+	int i,n;
+	int tcpPort=2626;
+
+
+	/* server socket */
+	int sock;
+	struct sockaddr_in name;
+	fd_set active_fd_set, read_fd_set;
+	struct sockaddr_in clientname;
+	size_t size;
 
 
 	/* command line arguments */
@@ -369,100 +441,101 @@ int main(int argc, char **argv) {
 	/* initialize data structures */
 	init();
 
+	/* create socket */
+	sock = socket(PF_INET, SOCK_STREAM, 0);
+	if (sock < 0) {
+		fprintf(stderr,"# error creating socket. Aborting.\n");
+		exit(1);
+	}
+
+	/* Give the socket a name. */
+	name.sin_family = AF_INET;
+	name.sin_port = htons(tcpPort);
+	name.sin_addr.s_addr = htonl(INADDR_ANY);
+	if ( bind( sock, (struct sockaddr *) &name, sizeof(name) ) < 0 ) {
+		fprintf(stderr,"# error binding socket. Aborting.\n");
+		exit(1);
+	}
+	/* setup socket to accept connections */
+	if ( listen(sock, 1) < 0 ) {
+		fprintf(stderr,"# error listening on socket. Aborting.\n");
+		exit(1);
+	}
+
+	/* Initialize the set of active sockets. */
+	FD_ZERO(&active_fd_set);
+	/* add socket fd to fd_set for select() */
+	FD_SET(sock, &active_fd_set);
+
 
 	/* install signal handler */
 	signal(SIGALRM, signal_handler); /* timeout */
 	signal(SIGUSR1, signal_handler); /* user signal to do data block debug dump */
 	signal(SIGPIPE, signal_handler); /* broken TCP connection */
 
-	/* setup serial port for Magnum network */
-	fd = open (portname, O_RDWR | O_NOCTTY | O_SYNC);
+	/* setup serial port for NMEA */
+	serialfd = open (portname, O_RDWR | O_NOCTTY | O_SYNC);
 	
-	if (fd < 0) {
+	if (serialfd < 0) {
 		fprintf(stderr,"# error opening serial port. Aborting.\n");
 		exit(1);
 	}	
 
 	/* NMEA runs at 4800 baud */
-	set_interface_attribs (fd, B4800, 0);  // set speed to 4800 bps, 8n1 (no parity)
-	set_blocking (fd, 0, 100);		// blocking with 10 second timeout
+	set_interface_attribs (serialfd, B4800, 0);  // set speed to 4800 bps, 8n1 (no parity)
+//	set_blocking (serialfd, 0, 100);		// blocking with 10 second timeout
+	set_blocking (serialfd, 0, 0);		// blocking with 10 second timeout
+
+	/* add serial fd to fd_set for select() */
+	FD_SET(serialfd, &active_fd_set);
 
 	/* set an alarm to send a SIGALARM if data not received within alarmSeconds */
 	alarm(alarmSeconds);
 
-	state=STATE_LOOKING_FOR_STX;
-	microtime_start=0;
 
-	/* read data from serial port */
 	for ( ; ; ) {
-		n = read (fd, buff, sizeof(buff));  // read next character if ready
-		microtime_now=microtime();
+		/* Block until input arrives on one or more active sockets. */
+		read_fd_set = active_fd_set;
 
-		/* non-blocking, so we will get here if there was no data available */
-		/* read timeout */
-		if ( 0 == n ) {
-			if ( outputDebug ) {
-				printf("(read returned 0 bytes)\n",n);
-			}
-			continue;
+		if ( select(FD_SETSIZE, &read_fd_set, NULL, NULL, NULL) < 0 ) {
+			fprintf(stderr,"# select() error. Aborting.\n");
+			exit(1);
 		}
 
-		/* cancel pending alarm */
-		alarm(0);
-		/* set an alarm to send a SIGALARM if data not received within alarmSeconds */
-		alarm(alarmSeconds);
+		/* Service all the sockets with input pending. */
+		for ( i=0 ; i < FD_SETSIZE ; ++i ) {
+			if ( FD_ISSET(i, &read_fd_set) ) {
+				if ( i == sock) {
+					/* Connection request on original socket. */
+					int new;
+					size = sizeof(clientname);
+					new = accept(sock, (struct sockaddr *) &clientname, &size);
 
-		milliseconds_since_stx=(int) ((microtime_now-microtime_start)/1000.0);
-
-
-
-
-		/* NMEA packets:
-			start with '$'
-			end with '\r' or '\n'
-			get aborted on timeout
-		*/
-
-		/* copy byte to packet */
-		for ( i=0 ; i<n ; i++ ) {
-			/* look for start character */
-			if ( STATE_LOOKING_FOR_STX == state && '$' ==  buff[i] ) {
-				packet_pos=0;
-				microtime_start=microtime_now;
-				state=STATE_IN_PACKET;
-				packet[0]='$';
-			}
-
-			if ( STATE_IN_PACKET == state ) {
-//				printf("---> milliseconds_since_stx = %d\n",milliseconds_since_stx);
-				if ( milliseconds_since_stx > milliseconds_timeout ) {
-					packet_pos=0;
-					state=STATE_LOOKING_FOR_STX;
-
-					if ( outputDebug ) {
-						printf("(timeout while reading NMEA sentence)\n");
+					if ( new < 0 ) {
+						fprintf(stderr,"# accept() error. Aborting.\n");
+						exit(1);
 					}
-					continue;
-				}
-		
-				if ( '\r' == buff[i] || '\n' == buff[i] ) {
-					state=STATE_LOOKING_FOR_STX;
 
-					/* process packet */
-					packet_processor(packet,packet_pos,microtime_start);
-				}
+					fprintf(stderr, "Server: connect from host %s, port %d.\n", inet_ntoa (clientname.sin_addr), ntohs (clientname.sin_port));
 
-				if ( packet_pos < sizeof(packet)-1 ) {
-					packet[packet_pos]=buff[i];
-					packet_pos++;
+					FD_SET(new, &active_fd_set);
+
+
+					/* dump current data */
+					json_to_client(new);
+
+					/* disconnect */
+					close(new);
+					FD_CLR(new, &active_fd_set);
+				} else if ( serialfd  == i ) {
+					/* serial port has something to do */
+					serial_process(serialfd);
+
+
 				} else {
-					if ( outputDebug ) {
-						printf("(packet length exceeded length of buffer!)\n");
-					}
+					printf("(fd=%d has something going on)\n");
 				}
-
 			}
-
 		}
 	}
 
