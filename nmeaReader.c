@@ -82,7 +82,7 @@ void dump_current_json(char *buff) {
 		sprintf(buff2,"\t\"%.*s\": {\n",5,data_block[i].sentence+1);
 		strcat(buff,buff2);
 
-		sprintf(buff2,"\t\t\"age\": %d,\n",(int) (microtime() - data_block[i].microtime_start) );
+		sprintf(buff2,"\t\t\"age\": %d,\n",(int) ((microtime() - data_block[i].microtime_start)/1000.0) );
 		strcat(buff,buff2);
 
 		sprintf(buff2,"\t\t\"sentence\": \"%s\"\n",data_block[i].sentence);
