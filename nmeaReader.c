@@ -497,10 +497,15 @@ int main(int argc, char **argv) {
 		/* Block until input arrives on one or more active sockets. */
 		read_fd_set = active_fd_set;
 
-		if ( select(FD_SETSIZE, &read_fd_set, NULL, NULL, NULL) < 0 ) {
-			fprintf(stderr,"# select() error. Aborting.\n");
+
+		i=select(FD_SETSIZE, &read_fd_set, NULL, NULL, NULL);
+		if ( EBADF == i ) {
+			fprintf(stderr,"# select() EBADF error. Aborting.\n");
 			exit(1);
-		}
+		} else if ( ENOMEM == i ) {
+			fprintf(stderr,"# select() ENOMEM error. Aborting.\n");
+			exit(1);
+		} 
 
 		/* Service all the sockets with input pending. */
 		for ( i=0 ; i < FD_SETSIZE ; ++i ) {
